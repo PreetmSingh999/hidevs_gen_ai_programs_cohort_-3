@@ -1,0 +1,112 @@
+
+
+
+from sentence_transformers import SentenceTransformer
+from haystack.document_stores import PineconeDocumentStore
+from haystack.nodes import EmbeddingRetriever
+from haystack.pipelines import DocumentSearchPipeline
+import networkx as nx
+import pinecone
+import numpy as np
+
+# Set up Pinecone with your API key
+pinecone.init(api_key="YOUR_PINECONE_API_KEY", environment="us-west1-gcp")
+
+# Create a Pinecone document store to manage and search our research papers
+document_store = PineconeDocumentStore(index="research-papers", similarity="cosine", embedding_dim=768)
+
+
+# Sample paper data (in real scenarios, you'd likely load this from a database)
+papers = [
+    {"title": "Deep Learning in NLP", "abstract": "This paper discusses DL techniques in NLP.", 
+     "authors": ["Author A"], "keywords": ["Deep Learning", "NLP"], "citation_count": 200},
+    {"title": "Graph Neural Networks", "abstract": "Exploring GNNs in social networks.", 
+     "authors": ["Author B"], "keywords": ["GNN", "Social Network"], "citation_count": 150},
+    # Add more papers as needed
+]
+
+
+# Initialize the knowledge graph
+kg = nx.Graph()
+
+# Populate the graph with nodes and edges
+for paper in papers:
+    kg.add_node(paper["title"], type="paper")
+    for author in paper["authors"]:
+        kg.add_node(author, type="author")
+        kg.add_edge(author, paper["title"], relation="authored")
+    for keyword in paper["keywords"]:
+        kg.add_node(keyword, type="topic")
+        kg.add_edge(keyword, paper["title"], relation="topic")
+
+# Optional: add citation information directly to the paper nodes
+for paper in papers:
+    kg.nodes[paper["title"]]["citation_count"] = paper["citation_count"]
+
+
+# Write the documents to the Pinecone document store
+for paper in papers:
+    document_store.write_documents([{
+        "content": paper["abstract"],
+        "meta": {
+            "title": paper["title"],
+            "authors": paper["authors"],
+            "keywords": paper["keywords"],
+        }
+    }])
+
+# Load an embedding model for encoding user queries and documents
+model = SentenceTransformer('all-mpnet-base-v2')
+retriever = EmbeddingRetriever(document_store=document_store, embedding_model=model, use_gpu=True)
+
+# Combine everything in a search pipeline
+pipeline = DocumentSearchPipeline(retriever=retriever)
+
+
+class ResearchPaperRecommender:
+    def __init__(self, pipeline, kg):
+        self.pipeline = pipeline
+        self.kg = kg
+        self.user_memory = []  # Track user queries across sessions
+
+    def multi_query_search(self, query, user_id):
+        # Save each user query for better session management
+        self.user_memory.append({"user_id": user_id, "query": query})
+        results = self.pipeline.run(query=query)
+        
+        # Re-rank the results based on KG context
+        enriched_results = self.rerank_with_kg(results, query)
+        return enriched_results
+
+    def rerank_with_kg(self, results, query):
+        # Re-rank results based on relationships in the KG
+        enriched_results = []
+        for res in results['documents']:
+            title = res.meta['title']
+            score = res.score
+            keywords = set(nx.neighbors(self.kg, title))
+            
+            # Boost score if related topics are found in KG neighbors
+            topic_match = any(keyword in query for keyword in keywords)
+            if topic_match:
+                score += 0.1  # Increase score for topic relevance
+            
+            enriched_results.append({"title": title, "abstract": res.content, "score": score})
+        
+        # Sort enriched results by adjusted score
+        enriched_results.sort(key=lambda x: x['score'], reverse=True)
+        return enriched_results
+
+# Initialize the recommender system
+recommender = ResearchPaperRecommender(pipeline, kg)
+
+# Example user query
+user_query = "advances in neural networks"
+user_id = "user123"
+
+# Get recommendations based on the user query
+recommended_papers = recommender.multi_query_search(user_query, user_id)
+
+# Display recommendations
+for paper in recommended_papers:
+    print(f"Title: {paper['title']}\nScore: {paper['score']}\nAbstract: {paper['abstract']}\n")
